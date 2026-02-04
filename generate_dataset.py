@@ -1,135 +1,175 @@
-import numpy as np
-import pandas as pd
-def test_sum(a:int=1,b:int=2):
-    return a+b
-
-
-def simulate_corsia_mrv_fuel_burn(
-    n_airlines: int = 600,
-    years=range(2019, 2026),
-    seed: int = 42,
-
-    # Fuel burn 분포(heavy-tail): lognormal(mean=ln_mu, sigma=ln_sigma)
-    # exp(ln_mu)는 2019년 중앙값 근처의 연료소모량(ton fuel)
-    ln_mu: float = 12.8,            # exp(12.8) ≈ 363k ton fuel (중앙값 느낌)
-    ln_sigma: float = 1.20,         # 쏠림 정도 (1.0~1.5면 강한 상위 집중)
-
-    # MRV 대상처럼 "너무 작은 사업자" 제거(연간 최소 연료소모량)
-    mrv_min_annual_tfuel: float = 80_000,
-
-    # 항공사별 연평균 성장률(연료소모 성장)
-    g_mean: float = 0.03,
-    g_sd: float = 0.04,
-
-    # 연도 공통 충격(글로벌 수요/유가/운항환경)
-    shock_sd: float = 0.08,
-
-    # 항공사-연도 특이 변동(소규모 noise)
-    idio_sd: float = 0.05,
-):
-    rng = np.random.default_rng(seed)
-
-    # 간단 국가/지역 더미(항공사 국적 = AOC 발급국)
-    countries = [
-        ("United States", "NAM"), ("China", "APAC"), ("United Kingdom", "EUR"),
-        ("Germany", "EUR"), ("France", "EUR"), ("United Arab Emirates", "MEA"),
-        ("Qatar", "MEA"), ("Turkey", "EUR"), ("Singapore", "APAC"),
-        ("Japan", "APAC"), ("Korea, Rep.", "APAC"), ("Australia", "APAC"),
-        ("India", "APAC"), ("Ethiopia", "AFR"), ("South Africa", "AFR"),
-        ("Brazil", "LAM"), ("Mexico", "LAM"), ("Chile", "LAM"),
-        ("Kenya", "AFR"), ("Canada", "NAM")
-    ]
-    country_names = np.array([c[0] for c in countries])
-    country_regions = {c[0]: c[1] for c in countries}
-
-    # 국가 가중치(대형 시장에 항공사 더 배치되는 느낌)
-    weights = np.array([
-        0.16, 0.14, 0.06, 0.06, 0.05, 0.05,
-        0.04, 0.04, 0.04, 0.04, 0.04, 0.03,
-        0.06, 0.02, 0.02, 0.04, 0.03, 0.02,
-        0.02, 0.04
-    ])
-    weights = weights / weights.sum()
-
-    # 항공사 식별자 + 국적 부여
-    airline_ids = [f"AL{str(i).zfill(4)}" for i in range(1, n_airlines + 1)]
-    operator_state = rng.choice(country_names, size=n_airlines, p=weights)
-    region = np.array([country_regions[s] for s in operator_state])
-
-    # 2019 기준 "기본 연료소모" (heavy-tail)
-    base_fuel_2019 = rng.lognormal(mean=ln_mu, sigma=ln_sigma, size=n_airlines)
-
-    # MRV 대상처럼 최소 컷 적용 (부족하면 추가 샘플로 채움)
-    mask = base_fuel_2019 >= mrv_min_annual_tfuel
-    while mask.sum() < n_airlines:
-        extra = rng.lognormal(mean=ln_mu, sigma=ln_sigma, size=n_airlines)
-        base_fuel_2019 = np.where(mask, base_fuel_2019, extra)
-        mask = base_fuel_2019 >= mrv_min_annual_tfuel
-
-    # 항공사별 성장률
-    g_i = rng.normal(loc=g_mean, scale=g_sd, size=n_airlines)
-    g_i = np.clip(g_i, -0.10, 0.20)
-
-    # 연도별 공통 충격(로그 스케일)
-    years = list(years)
-    year_shocks = {y: rng.normal(loc=0.0, scale=shock_sd) for y in years}
-
-    rows = []
-    for idx in range(n_airlines):
-        al_id = airline_ids[idx]
-        st = operator_state[idx]
-        reg = region[idx]
-        f0 = base_fuel_2019[idx]
-        gi = g_i[idx]
-
-        for y in years:
-            t = y - 2019
-            eps = rng.normal(0.0, idio_sd)
-
-            # FuelBurn = f0 * (1+gi)^t * exp(year_shock) * exp(idio_noise)
-            fuel = f0 * ((1.0 + gi) ** t) * np.exp(year_shocks[y]) * np.exp(eps)
-
-            rows.append({
-                "airline_id": al_id,
-                "operator_state": st,
-                "region": reg,
-                "year": y,
-                "fuel_burn_tonnes": float(fuel),
-                "g_i": float(gi),
-                "year_shock": float(year_shocks[y])
-            })
-
-    df = pd.DataFrame(rows).sort_values(["airline_id", "year"]).reset_index(drop=True)
-
-    # 연도별 점유율(상위 집중 확인용)
-    df["fuel_share_in_year"] = df.groupby("year")["fuel_burn_tonnes"].apply(lambda s: s / s.sum()).reset_index(level=0, drop=True)
-
-    return df
-
-
-
-if __name__ == "__main__":
-    df_fuel = simulate_corsia_mrv_fuel_burn(
-        n_airlines=600,
-        years=range(2019, 2026),
-        seed=7,
-        ln_mu=12.8,
-        ln_sigma=1.25,
-        mrv_min_annual_tfuel=100_000
-    )
-
-    print(df_fuel.head(10))
-
-    print("\nYearly totals (million tonnes fuel):")
-    print((df_fuel.groupby("year")["fuel_burn_tonnes"].sum() / 1e6).round(2))
-
-    top10_share = (
-        df_fuel.sort_values(["year", "fuel_burn_tonnes"], ascending=[True, False])
-               .groupby("year").head(10)
-               .groupby("year")["fuel_burn_tonnes"].sum()
-        / df_fuel.groupby("year")["fuel_burn_tonnes"].sum()
-    )
-    print("\nTop-10 airline fuel share by year:")
-    print(top10_share.round(3))
-
-# df_fuel[df_fuel['year'] == 2019].to_csv('./dataset/fuel_burn_2019_랜덤생성.csv', index=False)
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": 42,
+   "id": "ed71965b",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import numpy as np\n",
+    "import pandas as pd\n",
+    "\n",
+    "\n",
+    "def simulate_corsia_mrv_fuel_burn(\n",
+    "    n_airlines: int = 600,\n",
+    "    years=range(2019, 2026),\n",
+    "    seed: int = 42,\n",
+    "\n",
+    "    # Fuel burn 분포(heavy-tail): lognormal(mean=ln_mu, sigma=ln_sigma)\n",
+    "    # exp(ln_mu)는 2019년 중앙값 근처의 연료소모량(ton fuel)\n",
+    "    ln_mu: float = 12.8,            # exp(12.8) ≈ 363k ton fuel (중앙값 느낌)\n",
+    "    ln_sigma: float = 1.20,         # 쏠림 정도 (1.0~1.5면 강한 상위 집중)\n",
+    "\n",
+    "    # MRV 대상처럼 \"너무 작은 사업자\" 제거(연간 최소 연료소모량)\n",
+    "    mrv_min_annual_tfuel: float = 80_000,\n",
+    "\n",
+    "    # 항공사별 연평균 성장률(연료소모 성장)\n",
+    "    g_mean: float = 0.03,\n",
+    "    g_sd: float = 0.04,\n",
+    "\n",
+    "    # 연도 공통 충격(글로벌 수요/유가/운항환경)\n",
+    "    shock_sd: float = 0.08,\n",
+    "\n",
+    "    # 항공사-연도 특이 변동(소규모 noise)\n",
+    "    idio_sd: float = 0.05,\n",
+    "):\n",
+    "    rng = np.random.default_rng(seed)\n",
+    "\n",
+    "    # 간단 국가/지역 더미(항공사 국적 = AOC 발급국)\n",
+    "    countries = [\n",
+    "        (\"United States\", \"NAM\"), (\"China\", \"APAC\"), (\"United Kingdom\", \"EUR\"),\n",
+    "        (\"Germany\", \"EUR\"), (\"France\", \"EUR\"), (\"United Arab Emirates\", \"MEA\"),\n",
+    "        (\"Qatar\", \"MEA\"), (\"Turkey\", \"EUR\"), (\"Singapore\", \"APAC\"),\n",
+    "        (\"Japan\", \"APAC\"), (\"Korea, Rep.\", \"APAC\"), (\"Australia\", \"APAC\"),\n",
+    "        (\"India\", \"APAC\"), (\"Ethiopia\", \"AFR\"), (\"South Africa\", \"AFR\"),\n",
+    "        (\"Brazil\", \"LAM\"), (\"Mexico\", \"LAM\"), (\"Chile\", \"LAM\"),\n",
+    "        (\"Kenya\", \"AFR\"), (\"Canada\", \"NAM\")\n",
+    "    ]\n",
+    "    country_names = np.array([c[0] for c in countries])\n",
+    "    country_regions = {c[0]: c[1] for c in countries}\n",
+    "\n",
+    "    # 국가 가중치(대형 시장에 항공사 더 배치되는 느낌)\n",
+    "    weights = np.array([\n",
+    "        0.16, 0.14, 0.06, 0.06, 0.05, 0.05,\n",
+    "        0.04, 0.04, 0.04, 0.04, 0.04, 0.03,\n",
+    "        0.06, 0.02, 0.02, 0.04, 0.03, 0.02,\n",
+    "        0.02, 0.04\n",
+    "    ])\n",
+    "    weights = weights / weights.sum()\n",
+    "\n",
+    "    # 항공사 식별자 + 국적 부여\n",
+    "    airline_ids = [f\"AL{str(i).zfill(4)}\" for i in range(1, n_airlines + 1)]\n",
+    "    operator_state = rng.choice(country_names, size=n_airlines, p=weights)\n",
+    "    region = np.array([country_regions[s] for s in operator_state])\n",
+    "\n",
+    "    # 2019 기준 \"기본 연료소모\" (heavy-tail)\n",
+    "    base_fuel_2019 = rng.lognormal(mean=ln_mu, sigma=ln_sigma, size=n_airlines)\n",
+    "\n",
+    "    # MRV 대상처럼 최소 컷 적용 (부족하면 추가 샘플로 채움)\n",
+    "    mask = base_fuel_2019 >= mrv_min_annual_tfuel\n",
+    "    while mask.sum() < n_airlines:\n",
+    "        extra = rng.lognormal(mean=ln_mu, sigma=ln_sigma, size=n_airlines)\n",
+    "        base_fuel_2019 = np.where(mask, base_fuel_2019, extra)\n",
+    "        mask = base_fuel_2019 >= mrv_min_annual_tfuel\n",
+    "\n",
+    "    # 항공사별 성장률\n",
+    "    g_i = rng.normal(loc=g_mean, scale=g_sd, size=n_airlines)\n",
+    "    g_i = np.clip(g_i, -0.10, 0.20)\n",
+    "\n",
+    "    # 연도별 공통 충격(로그 스케일)\n",
+    "    years = list(years)\n",
+    "    year_shocks = {y: rng.normal(loc=0.0, scale=shock_sd) for y in years}\n",
+    "\n",
+    "    rows = []\n",
+    "    for idx in range(n_airlines):\n",
+    "        al_id = airline_ids[idx]\n",
+    "        st = operator_state[idx]\n",
+    "        reg = region[idx]\n",
+    "        f0 = base_fuel_2019[idx]\n",
+    "        gi = g_i[idx]\n",
+    "\n",
+    "        for y in years:\n",
+    "            t = y - 2019\n",
+    "            eps = rng.normal(0.0, idio_sd)\n",
+    "\n",
+    "            # FuelBurn = f0 * (1+gi)^t * exp(year_shock) * exp(idio_noise)\n",
+    "            fuel = f0 * ((1.0 + gi) ** t) * np.exp(year_shocks[y]) * np.exp(eps)\n",
+    "\n",
+    "            rows.append({\n",
+    "                \"airline_id\": al_id,\n",
+    "                \"operator_state\": st,\n",
+    "                \"region\": reg,\n",
+    "                \"year\": y,\n",
+    "                \"fuel_burn_tonnes\": float(fuel),\n",
+    "                \"g_i\": float(gi),\n",
+    "                \"year_shock\": float(year_shocks[y])\n",
+    "            })\n",
+    "\n",
+    "    df = pd.DataFrame(rows).sort_values([\"airline_id\", \"year\"]).reset_index(drop=True)\n",
+    "\n",
+    "    # 연도별 점유율(상위 집중 확인용)\n",
+    "    df[\"fuel_share_in_year\"] = df.groupby(\"year\")[\"fuel_burn_tonnes\"].apply(lambda s: s / s.sum()).reset_index(level=0, drop=True)\n",
+    "\n",
+    "    return df\n",
+    "\n",
+    "\n",
+    "\n",
+    "if __name__ == \"__main__\":\n",
+    "    df_fuel = simulate_corsia_mrv_fuel_burn(\n",
+    "        n_airlines=600,\n",
+    "        years=range(2019, 2026),\n",
+    "        seed=7,\n",
+    "        ln_mu=12.8,\n",
+    "        ln_sigma=1.25,\n",
+    "        mrv_min_annual_tfuel=100_000\n",
+    "    )\n",
+    "\n",
+    "    print(df_fuel.head(10))\n",
+    "\n",
+    "    print(\"\\nYearly totals (million tonnes fuel):\")\n",
+    "    print((df_fuel.groupby(\"year\")[\"fuel_burn_tonnes\"].sum() / 1e6).round(2))\n",
+    "\n",
+    "    top10_share = (\n",
+    "        df_fuel.sort_values([\"year\", \"fuel_burn_tonnes\"], ascending=[True, False])\n",
+    "               .groupby(\"year\").head(10)\n",
+    "               .groupby(\"year\")[\"fuel_burn_tonnes\"].sum()\n",
+    "        / df_fuel.groupby(\"year\")[\"fuel_burn_tonnes\"].sum()\n",
+    "    )\n",
+    "    print(\"\\nTop-10 airline fuel share by year:\")\n",
+    "    print(top10_share.round(3))\n",
+    "\n",
+    "# df_fuel[df_fuel['year'] == 2019].to_csv('./dataset/fuel_burn_2019_랜덤생성.csv', index=False)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "fe95fd9c",
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "bibiml",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.11.11"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
